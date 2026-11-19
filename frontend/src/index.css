@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  @apply bg-ink text-slate-200 font-sans antialiased;
+  background-image:
+    radial-gradient(900px 500px at 85% -10%, rgba(74, 216, 255, 0.10), transparent 60%),
+    radial-gradient(700px 400px at 0% 0%, rgba(198, 255, 74, 0.08), transparent 55%);
+  background-attachment: fixed;
+}
+
+.card {
+  @apply rounded-2xl border border-edge bg-panel/80 p-5 backdrop-blur;
+}
+
+.label {
+  @apply text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500;
+}
+
+.pill {
+  @apply inline-flex items-center gap-1.5 rounded-full border border-edge px-2.5 py-1 text-[11px] font-semibold;
+}
+
+.btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl px-3.5 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40;
+}
+
+.btn-primary {
+  @apply btn bg-lime text-ink hover:bg-lime/90;
+}
+
+.btn-ghost {
+  @apply btn border border-edge bg-white/[0.02] text-slate-200 hover:border-cyan/40 hover:text-cyan;
+}
+
+.btn-danger {
+  @apply btn border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20;
+}
+
+.mono {
+  @apply font-mono text-[12px];
+}
+
+.scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: #24344a;
+  border-radius: 999px;
+}

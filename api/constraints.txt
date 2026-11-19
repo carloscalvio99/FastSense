@@ -1,0 +1,4 @@
+# Compatibilidad C/Cython de scikit-surprise 1.1.3.
+# numpy 2.x rompe el build; Cython 3 puede generar código incompatible.
+numpy==1.26.4
+Cython<3.0

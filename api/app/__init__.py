@@ -1,0 +1,1 @@
+"""FastSense · microservicio de inferencia."""

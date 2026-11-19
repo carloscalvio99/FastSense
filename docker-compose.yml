@@ -1,0 +1,400 @@
+name: fastsense
+
+# =====================================================================
+# FastSense · plataforma local reproducible
+#   docker compose up --build -d
+#   docker compose --profile test run --rm tests
+#   docker compose --profile load up -d locust
+# =====================================================================
+
+x-aws-env: &aws-env
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+  AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-http://localstack:4566}
+  S3_BUCKET: ${S3_BUCKET:-fastsense-datalake-models}
+  S3_MODEL_KEY: ${S3_MODEL_KEY:-models/model.pkl}
+  S3_MANIFEST_KEY: ${S3_MANIFEST_KEY:-models/manifest.json}
+  S3_LAKE_PREFIX: ${S3_LAKE_PREFIX:-datalake/interactions}
+  SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-fastsense-interactions-queue}
+  SQS_DLQ_NAME: ${SQS_DLQ_NAME:-fastsense-interactions-dlq}
+  SQS_QUEUE_URL: http://localstack:4566/000000000000/${SQS_QUEUE_NAME:-fastsense-interactions-queue}
+  SQS_DLQ_URL: http://localstack:4566/000000000000/${SQS_DLQ_NAME:-fastsense-interactions-dlq}
+
+x-mysql-env: &mysql-env
+  MYSQL_HOST: mysql
+  MYSQL_PORT: "3306"
+  MYSQL_DATABASE: ${MYSQL_DATABASE:-fastsense}
+  MYSQL_USER: ${MYSQL_USER:-fastsense}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD:-fastsense}
+  DATABASE_URL: mysql+pymysql://${MYSQL_USER:-fastsense}:${MYSQL_PASSWORD:-fastsense}@mysql:3306/${MYSQL_DATABASE:-fastsense}?charset=utf8mb4
+
+x-security-env: &security-env
+  API_KEY: ${API_KEY:-fs_demo_key_2026}
+  JWT_SECRET: ${JWT_SECRET:-fastsense_local_jwt_secret_2026_change_me}
+  INTERNAL_TOKEN: ${INTERNAL_TOKEN:-fastsense_internal_2026}
+  PII_SALT: ${PII_SALT:-fastsense-pii-salt-2026}
+  LOG_HASH_SALT: ${LOG_HASH_SALT:-fastsense-log-salt-2026}
+
+services:
+  # ------------------------------------------------------------------
+  # Borde L7: rate limiting, least_conn, keepalive, timeouts y request-id
+  # ------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: fastsense-nginx
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O /dev/null http://127.0.0.1:8080/health",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # API de inferencia (escalable horizontalmente)
+  # ------------------------------------------------------------------
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: fastsense/api:local
+    deploy:
+      replicas: ${API_REPLICAS:-1}
+    expose:
+      - "8080"
+    env_file:
+      - .env
+    environment:
+      <<: [*mysql-env, *aws-env, *security-env]
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      APP_VERSION: ${APP_VERSION:-3.0.0}
+      SVD_TIMEOUT_MS: ${SVD_TIMEOUT_MS:-400}
+      CIRCUIT_BREAKER_FAIL_MAX: ${CIRCUIT_BREAKER_FAIL_MAX:-3}
+      CIRCUIT_BREAKER_RESET_S: ${CIRCUIT_BREAKER_RESET_S:-30}
+      MODEL_POLL_SECONDS: ${MODEL_POLL_SECONDS:-10}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      LOG_LEVEL: INFO
+      MALLOC_ARENA_MAX: "2"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2); urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=2)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+    restart: unless-stopped
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Worker de ingesta asíncrona SQS -> MySQL + Parquet/S3
+  # ------------------------------------------------------------------
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    image: fastsense/worker:local
+    env_file:
+      - .env
+    environment:
+      <<: [*mysql-env, *aws-env, *security-env]
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SQS_WAIT_TIME_SECONDS: "5"
+      SQS_MAX_MESSAGES: "10"
+      SQS_POLL_INTERVAL_SECONDS: "1"
+      WORKER_HEARTBEAT: /tmp/fastsense-worker.heartbeat
+      MALLOC_ARENA_MAX: "2"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,sys; sys.exit(0 if os.path.exists('/tmp/fastsense-worker.heartbeat') else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Caché distribuida + fallback
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: fastsense-redis
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory",
+        "256mb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+      ]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Base transaccional MySQL 8.0
+  # ------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: fastsense-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --innodb-buffer-pool-size=64M
+      - --performance-schema=OFF
+      - --max-connections=100
+      - --table-open-cache=64
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-fastsense_root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-fastsense}
+      MYSQL_USER: ${MYSQL_USER:-fastsense}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-fastsense}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Emulación AWS: SQS + S3 con versionado
+  # ------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: fastsense-localstack
+    environment:
+      SERVICES: sqs,s3
+      DEBUG: "0"
+      PERSISTENCE: "0"
+      LS_LOG: warn
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "awslocal sqs list-queues >/dev/null 2>&1 && awslocal s3api head-bucket --bucket ${S3_BUCKET:-fastsense-datalake-models} >/dev/null 2>&1",
+        ]
+      interval: 10s
+      # awslocal tarda ~3 s por llamada en este host: dos llamadas superan 5 s.
+      timeout: 20s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Pipeline batch MLOps: seeding, entrenamiento, quality gate y promoción
+  # ------------------------------------------------------------------
+  ml-trainer:
+    build:
+      context: ./ml-training
+      dockerfile: Dockerfile
+    image: fastsense/ml-trainer:local
+    container_name: fastsense-ml-trainer
+    env_file:
+      - .env
+    environment:
+      <<: [*mysql-env, *aws-env, *security-env]
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      N_FACTORS: ${N_FACTORS:-50}
+      N_EPOCHS: ${N_EPOCHS:-20}
+      TEST_SIZE: ${TEST_SIZE:-0.2}
+      RMSE_GATE: ${RMSE_GATE:-0.85}
+      SEED: ${SEED:-42}
+      TOTAL_PRODUCTS: ${TOTAL_PRODUCTS:-5000}
+      TOTAL_USERS: ${TOTAL_USERS:-50000}
+      TOTAL_INTERACTIONS: ${TOTAL_INTERACTIONS:-180000}
+      API_RELOAD_URL: http://api:8080/internal/reload-model
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: "no"
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Frontend React 18 + Vite + Tailwind (tienda + dashboard MLOps)
+  # ------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+        VITE_API_KEY: ${API_KEY:-fs_demo_key_2026}
+        VITE_JWT_TOKEN: ${JWT_TOKEN:-}
+        VITE_INTERNAL_TOKEN: ${INTERNAL_TOKEN:-fastsense_internal_2026}
+    image: fastsense/frontend:local
+    container_name: fastsense-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Suite pytest (perfil "test"). No forma parte del runtime normal.
+  # ------------------------------------------------------------------
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    image: fastsense/tests:local
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8080
+      API_KEY: ${API_KEY:-fs_demo_key_2026}
+      JWT_TOKEN: ${JWT_TOKEN:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-fastsense_internal_2026}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-fastsense}
+      MYSQL_USER: ${MYSQL_USER:-fastsense}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-fastsense}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-http://localstack:4566}
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/${SQS_QUEUE_NAME:-fastsense-interactions-queue}
+      SQS_DLQ_URL: http://localstack:4566/000000000000/${SQS_DLQ_NAME:-fastsense-interactions-dlq}
+      S3_BUCKET: ${S3_BUCKET:-fastsense-datalake-models}
+      PII_SALT: ${PII_SALT:-fastsense-pii-salt-2026}
+      JWT_SECRET: ${JWT_SECRET:-fastsense_local_jwt_secret_2026_change_me}
+      NGINX_BASE_URL: http://nginx:8080
+      READY_TIMEOUT_SECONDS: "240"
+    depends_on:
+      api:
+        condition: service_started
+      nginx:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    command: ["pytest", "-v", "--tb=short", "/app/tests"]
+    networks: [fastsense]
+
+  # ------------------------------------------------------------------
+  # Locust (perfil "load"). Interfaz web en http://localhost:8089
+  # ------------------------------------------------------------------
+  locust:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    image: fastsense/tests:local
+    env_file:
+      - .env
+    environment:
+      LOCUST_HOST: http://nginx:8080
+      API_KEY: ${API_KEY:-fs_demo_key_2026}
+      JWT_TOKEN: ${JWT_TOKEN:-}
+    depends_on:
+      nginx:
+        condition: service_started
+    ports:
+      - "8089:8089"
+    command:
+      [
+        "locust",
+        "-f",
+        "/app/tests/locustfile.py",
+        "--host",
+        "http://nginx:8080",
+      ]
+    networks: [fastsense]
+
+volumes:
+  mysql_data:
+  redis_data:
+  localstack_data:
+
+networks:
+  fastsense:
+    driver: bridge
